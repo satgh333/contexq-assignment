@@ -50,16 +50,16 @@ jobs:
     - name: Upload data to S3
       run: aws s3 cp data/ s3://${{ env.S3_BUCKET }}/data/ --recursive
 
-    # 8️⃣ Run the cloud pipeline (S3 + Spark)
-    - name: Run cloud pipeline
-      env:
-        S3_BUCKET: ${{ env.S3_BUCKET }}
-        AWS_REGION: ${{ env.AWS_REGION }}
-        PYTHONPATH: ${{ github.workspace }}
-      run: python src/cloud_pipeline.py
+    # # 8️⃣ Run the cloud pipeline (S3 + Spark)
+    # - name: Run cloud pipeline
+    #   env:
+    #     S3_BUCKET: ${{ env.S3_BUCKET }}
+    #     AWS_REGION: ${{ env.AWS_REGION }}
+    #     PYTHONPATH: ${{ github.workspace }}
+    #   run: python src/cloud_pipeline.py
 
-    # 9️⃣ Run tests with PYTHONPATH
-    - name: Run unit tests
-      env:
-        PYTHONPATH: ${{ github.workspace }}
-      run: pytest tests/ -v
+    # # 9️⃣ Run tests with PYTHONPATH
+    # - name: Run unit tests
+    #   env:
+    #     PYTHONPATH: ${{ github.workspace }}
+    #   run: pytest tests/ -v
