@@ -2,7 +2,7 @@
 
 ## 🚀 Cloud-Based Data Pipeline
 
-This project runs entirely in the cloud using GitHub Actions and AWS services. No local setup required.
+This project demonstrates a scheduled-style data+ML job that reads **two source datasets from S3**, performs **entity resolution / harmonization**, upserts into an **Apache Iceberg** table, then trains a **PySpark ML** model and registers metadata to a lightweight registry.
 
 ---
 
@@ -36,10 +36,9 @@ aws configure
 # Create S3 bucket (replace 'your-unique-bucket-name' with your actual bucket name)
 aws s3 mb s3://your-unique-bucket-name
 
-# The pipeline will automatically upload data files to S3 when it runs
-# No manual upload needed - the pipeline creates these folders:
-# s3://your-bucket/data/          (input data files)
-# s3://your-bucket/output/        (processed results)
+# Upload sample data (or your real sources) to S3
+aws s3 cp data/supply_chain_data.json s3://your-unique-bucket-name/data/supply_chain_data.json
+aws s3 cp data/financial_data.json s3://your-unique-bucket-name/data/financial_data.json
 
 # Create Glue database
 aws glue create-database --database-input Name=corporate_data
@@ -64,7 +63,7 @@ S3_BUCKET: your-unique-bucket-name
 
 **Option A: Simple Execution (Recommended)**
 - Go to GitHub repository → Actions tab
-- Click **"Data AI Pipeline"** workflow
+- Click **"Workflow4"** workflow (manual cloud run)
 - Click "Run workflow" button
 - Select branch and click "Run workflow"
 
@@ -151,7 +150,8 @@ This cloud-native data pipeline:
 - **AWS S3**: Data lake storage for input and output data
 - **AWS Glue**: Metadata catalog for Iceberg tables
 - **PySpark**: Distributed data processing and ML training
-- **MLflow**: Experiment tracking and model management
+- **MLflow**: Experiment tracking (optional)
+- **Lightweight registry**: JSON registry file (local or S3) for model metadata/versioning
 
 #### Processing Steps
 1. **Data Upload**: GitHub Actions uploads data to S3
@@ -216,11 +216,12 @@ This cloud-native data pipeline:
 ├── src/
 │   ├── etl_pipeline.py      # Main ETL/ML pipeline
 │   ├── local_pipeline.py    # Local execution version
-│   ├── cloud_pipeline.py    # S3-enabled cloud version
+│   ├── cloud_pipeline.py    # EMR/Glue-focused wrapper (S3 inputs)
 │   ├── entity_resolution.py # Deduplication logic
 │   └── ml_training.py       # ML model training
 ├── tests/
 │   └── test_entity_resolution.py
+│   └── test_contracts.py    # Data contract (schema) checks
 ├── data/
 │   ├── supply_chain_data.json
 │   └── financial_data.json
@@ -231,6 +232,53 @@ This cloud-native data pipeline:
 │   └── main.tf
 ├── fix_json.py              # JSON format converter
 └── requirements.txt
+```
+
+---
+
+## Run the pipeline reading sources from S3
+
+Set these environment variables (locally, in GitHub Actions, or on EMR):
+
+```bash
+export SOURCE1_URI="s3a://<bucket>/data/supply_chain_data.json"
+export SOURCE2_URI="s3a://<bucket>/data/financial_data.json"
+
+# Iceberg catalog (choose one):
+# - Local lightweight metastore (default):
+export ICEBERG_CATALOG_NAME="local"
+export ICEBERG_CATALOG_TYPE="hadoop"
+export ICEBERG_WAREHOUSE="file:/tmp/iceberg/warehouse"
+
+# - AWS Glue catalog (typical for EMR):
+# export ICEBERG_CATALOG_NAME="glue_catalog"
+# export ICEBERG_CATALOG_TYPE="glue"
+# export ICEBERG_WAREHOUSE="s3://<bucket>/warehouse"
+
+export MODEL_REGISTRY_URI="s3://<bucket>/models/model_registry.json"
+```
+
+Run:
+
+```bash
+python -m src.etl_pipeline
+```
+
+Query the Iceberg table (example):
+
+```python
+spark.sql("SELECT corporate_id, corporate_name, revenue, profit FROM local.corporate_data.corporate_registry").show()
+```
+
+---
+
+## Creating a new GitHub repository for this project
+
+If you want this as a brand-new repo:
+
+```bash
+gh repo create <your-org-or-user>/<new-repo-name> --public --source . --remote origin
+git push -u origin main
 ```
 
 ---

@@ -1,4 +1,3 @@
-# jm_requirement
 from airflow import DAG
 from airflow.providers.amazon.aws.operators.emr import EmrAddStepsOperator
 from airflow.providers.amazon.aws.sensors.emr import EmrStepSensor
