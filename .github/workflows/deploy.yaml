@@ -1,0 +1,47 @@
+name: CD - Deploy Pipeline to S3 (and optionally EMR)
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload pipeline code to S3
+        run: |
+          set -euo pipefail
+          aws s3 sync src/ "s3://${{ secrets.S3_BUCKET }}/scripts/" --exclude "*.pyc" --exclude "__pycache__/*"
+          zip -r src_package.zip src -x "*.pyc" "*/__pycache__/*"
+          aws s3 cp src_package.zip "s3://${{ secrets.S3_BUCKET }}/scripts/src_package.zip"
+          aws s3 ls "s3://${{ secrets.S3_BUCKET }}/scripts/" --recursive
+
+      - name: Trigger EMR step (optional)
+        env:
+          EMR_CLUSTER_ID: ${{ secrets.EMR_CLUSTER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EMR_CLUSTER_ID:-}" ]; then
+            echo "EMR_CLUSTER_ID not set; skipping EMR submission."
+            exit 0
+          fi
+
+          echo "Submitting Spark step to EMR cluster ${EMR_CLUSTER_ID}..."
+          aws emr add-steps \
+            --cluster-id "${EMR_CLUSTER_ID}" \
+            --steps Type=Spark,Name=CorporateDataPipeline,ActionOnFailure=CONTINUE,Args=[--deploy-mode,cluster,--conf,spark.yarn.appMasterEnv.S3_BUCKET=${{ secrets.S3_BUCKET }},--conf,spark.executorEnv.S3_BUCKET=${{ secrets.S3_BUCKET }},--conf,spark.yarn.appMasterEnv.ENABLE_SPARK_PACKAGES=0,--conf,spark.executorEnv.ENABLE_SPARK_PACKAGES=0,--py-files,s3://${{ secrets.S3_BUCKET }}/scripts/src_package.zip,s3://${{ secrets.S3_BUCKET }}/scripts/cloud_pipeline.py]
+

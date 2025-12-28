@@ -1,12 +1,10 @@
-# jm_requirement
 #!/bin/bash
 
 # EMR Bootstrap script to install dependencies
 sudo python3 -m pip install --upgrade pip
-sudo python3 -m pip install pyiceberg[s3fs,glue]==0.5.1
-sudo python3 -m pip install mlflow==2.8.1
-sudo python3 -m pip install python-Levenshtein==0.21.1
-sudo python3 -m pip install boto3==1.29.7
+sudo python3 -m pip install mlflow==3.8.0
+sudo python3 -m pip install python-Levenshtein==0.27.3
+sudo python3 -m pip install boto3==1.35.0
 
-# Download Iceberg Spark runtime
-sudo wget https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.4_2.12/1.4.2/iceberg-spark-runtime-3.4_2.12-1.4.2.jar -P /usr/lib/spark/jars/
+# Iceberg Spark runtime is typically installed on EMR via configurations.
+# If needed, you can install a compatible runtime jar for your EMR Spark version here.

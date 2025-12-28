@@ -1,4 +1,3 @@
-# jm_requirement
 # Data & AI Engineering Pipeline - Project Structure
 
 ```

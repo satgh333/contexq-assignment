@@ -1,4 +1,3 @@
-# jm_requirement
 terraform {
   required_providers {
     aws = {
