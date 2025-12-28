@@ -1,0 +1,51 @@
+name: Workflow11 - View S3 Scripts
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  view-s3-scripts:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ Checkout repo (optional, but harmless)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2️⃣ Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 3️⃣ List files in S3 scripts folder
+      - name: List scripts in S3
+        run: |
+          echo "=== Files in S3 scripts folder ==="
+          aws s3 ls s3://${{ secrets.S3_BUCKET }}/scripts/
+
+      # 4️⃣ Show cloud_pipeline.py content
+      - name: Show cloud_pipeline.py
+        run: |
+          echo "===== cloud_pipeline.py ====="
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/scripts/cloud_pipeline.py - \
+            || echo "cloud_pipeline.py not found"
+
+      # 5️⃣ Show ml_training.py content
+      - name: Show ml_training.py
+        run: |
+          echo "===== ml_training.py ====="
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/scripts/ml_training.py - \
+            || echo "ml_training.py not found"
+
+      # 6️⃣ Show entity_resolution.py content
+      - name: Show entity_resolution.py
+        run: |
+          echo "===== entity_resolution.py ====="
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/scripts/entity_resolution.py - \
+            || echo "entity_resolution.py not found"
