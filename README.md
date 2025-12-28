@@ -4,7 +4,7 @@
 
 This project runs entirely in the cloud using GitHub Actions and AWS services. No local setup required.
 
----
+--- 
 
 ## Quick Start - Deploy to AWS Cloud
 
