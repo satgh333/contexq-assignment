@@ -1,4 +1,4 @@
-name: Workflow12
+name: Workflow13
 
 on:
   workflow_dispatch:
@@ -29,13 +29,9 @@ jobs:
           aws s3 cp src/ s3://${{ secrets.S3_BUCKET }}/scripts/ --recursive
 
 
-      - name: Trigger EMR Spark job
+      - name: Trigger EMR Spark jobs (WRITE → READ)
         run: |
           aws emr add-steps \
             --cluster-id "${{ secrets.EMR_CLUSTER_ID }}" \
             --steps \
-            Type=Spark,Name=CorporateRegistryIcebergMerge,ActionOnFailure=CONTINUE,Args=[
-              --deploy-mode,cluster,
-              --py-files,s3://${{ secrets.S3_BUCKET }}/scripts/entity_resolution.py,s3://${{ secrets.S3_BUCKET }}/scripts/ml_training.py,
-              s3://${{ secrets.S3_BUCKET }}/scripts/cloud_pipeline.py
-            ]
+            Type=Spark,Name=CorporateRegistryIcebergMerge,ActionOnFailure=CONTINUE,Args=[--deploy-mode,cluster,s3://${{ secrets.S3_BUCKET }}/scripts/single_pipliene.py]
