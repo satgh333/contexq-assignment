@@ -35,15 +35,14 @@ jobs:
       - name: Package Python dependencies
         run: |
           echo "📦 Creating Python package for dependencies..."
-          cd src
-          # Create zip with files at root level (no directory structure)
-          zip -j ../scripts_package.zip entity_resolution.py ml_training.py __init__.py
-          cd ..
-          # Verify zip contents
+          # Package the full src/ module (so cloud_pipeline.py can import src.etl_pipeline, etc.)
+          zip -r src_package.zip src -x "*.pyc" "*/__pycache__/*"
+
           echo "📋 Zip file contents:"
-          unzip -l scripts_package.zip || echo "Could not list zip contents"
-          aws s3 cp scripts_package.zip s3://${{ secrets.S3_BUCKET }}/scripts/scripts_package.zip
-          echo "✅ Dependencies packaged and uploaded"
+          unzip -l src_package.zip || echo "Could not list zip contents"
+
+          aws s3 cp src_package.zip s3://${{ secrets.S3_BUCKET }}/scripts/src_package.zip
+          echo "✅ Packaged and uploaded: s3://${{ secrets.S3_BUCKET }}/scripts/src_package.zip"
 
       # 4.5️⃣ Check EMR cluster state and handle lifecycle
       - name: Check and manage EMR cluster state
@@ -126,7 +125,7 @@ jobs:
           CLUSTER_ID="${{ secrets.EMR_CLUSTER_ID }}"
           echo "🚀 Submitting Spark job to EMR cluster: $CLUSTER_ID"
           echo "📂 Main script: s3://${{ secrets.S3_BUCKET }}/scripts/cloud_pipeline.py"
-          echo "📦 Dependencies: s3://${{ secrets.S3_BUCKET }}/scripts/scripts_package.zip"
+          echo "📦 Dependencies: s3://${{ secrets.S3_BUCKET }}/scripts/src_package.zip"
           
           # Submit the job and capture step ID
           # Using --py-files to include dependencies as a zip file
@@ -134,7 +133,7 @@ jobs:
           STEP_OUTPUT=$(aws emr add-steps \
             --cluster-id "$CLUSTER_ID" \
             --steps \
-            Type=Spark,Name=CorporateRegistryIcebergMerge,ActionOnFailure=CONTINUE,Args=[--deploy-mode,cluster,--conf,spark.yarn.appMasterEnv.S3_BUCKET=${{ secrets.S3_BUCKET }},--conf,spark.executorEnv.S3_BUCKET=${{ secrets.S3_BUCKET }},--py-files,s3://${{ secrets.S3_BUCKET }}/scripts/scripts_package.zip,s3://${{ secrets.S3_BUCKET }}/scripts/cloud_pipeline.py] 2>&1)
+            Type=Spark,Name=CorporateRegistryIcebergMerge,ActionOnFailure=CONTINUE,Args=[--deploy-mode,cluster,--conf,spark.yarn.appMasterEnv.S3_BUCKET=${{ secrets.S3_BUCKET }},--conf,spark.executorEnv.S3_BUCKET=${{ secrets.S3_BUCKET }},--conf,spark.yarn.appMasterEnv.SOURCE1_URI=s3a://${{ secrets.S3_BUCKET }}/data/supply_chain_data.json,--conf,spark.executorEnv.SOURCE1_URI=s3a://${{ secrets.S3_BUCKET }}/data/supply_chain_data.json,--conf,spark.yarn.appMasterEnv.SOURCE2_URI=s3a://${{ secrets.S3_BUCKET }}/data/financial_data.json,--conf,spark.executorEnv.SOURCE2_URI=s3a://${{ secrets.S3_BUCKET }}/data/financial_data.json,--conf,spark.yarn.appMasterEnv.MODEL_REGISTRY_URI=s3://${{ secrets.S3_BUCKET }}/models/model_registry.json,--conf,spark.executorEnv.MODEL_REGISTRY_URI=s3://${{ secrets.S3_BUCKET }}/models/model_registry.json,--conf,spark.yarn.appMasterEnv.ENABLE_SPARK_PACKAGES=0,--conf,spark.executorEnv.ENABLE_SPARK_PACKAGES=0,--py-files,s3://${{ secrets.S3_BUCKET }}/scripts/src_package.zip,s3://${{ secrets.S3_BUCKET }}/scripts/cloud_pipeline.py] 2>&1)
           
           # Check if the command succeeded
           if [ $? -ne 0 ]; then
