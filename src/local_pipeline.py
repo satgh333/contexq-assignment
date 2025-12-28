@@ -1,6 +1,7 @@
 # jm_requirement
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit, size
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, LongType
 from src.entity_resolution import assign_corporate_ids
 from src.ml_training import train_model
 import json
@@ -68,7 +69,17 @@ def run_local_pipeline():
                     "profit": row["profit"]
                 })
         
-        harmonized_df = spark.createDataFrame(harmonized_records)
+        # Define schema explicitly for consistency
+        schema = StructType([
+            StructField("corporate_id", LongType(), True),
+            StructField("corporate_name", StringType(), True),
+            StructField("address", StringType(), True),
+            StructField("supplier_count", IntegerType(), True),
+            StructField("revenue", DoubleType(), True),
+            StructField("profit", DoubleType(), True)
+        ])
+        
+        harmonized_df = spark.createDataFrame(harmonized_records, schema=schema)
         
         # Save locally
         harmonized_df.write.mode("overwrite").parquet("output/harmonized_data")

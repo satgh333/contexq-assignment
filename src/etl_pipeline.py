@@ -2,6 +2,7 @@
 import os
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit, size, split
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, LongType
 from pyiceberg.catalog import load_catalog
 from entity_resolution import assign_corporate_ids
 from ml_training import train_model
@@ -40,7 +41,7 @@ def harmonize_data(spark, supply_df, financial_df):
     # Process supply chain data
     supply_pandas = supply_df.toPandas()
     for idx, row in supply_pandas.iterrows():
-        corporate_id = id_mapping[f"s1_{idx}"]
+        corporate_id = id_mapping[f"s1_{idx}"]  # Keep as integer for BIGINT table
         harmonized_records.append({
             "corporate_id": corporate_id,
             "corporate_name": row["corporate_name_S1"],
@@ -55,7 +56,7 @@ def harmonize_data(spark, supply_df, financial_df):
     # Process financial data
     financial_pandas = financial_df.toPandas()
     for idx, row in financial_pandas.iterrows():
-        corporate_id = id_mapping[f"s2_{idx}"]
+        corporate_id = id_mapping[f"s2_{idx}"]  # Keep as integer for BIGINT table
         
         # Check if this corporate_id already exists
         existing_record = None
@@ -82,7 +83,19 @@ def harmonize_data(spark, supply_df, financial_df):
                 "main_customers": row["main_customers"]
             })
     
-    return spark.createDataFrame(harmonized_records)
+    # Define schema explicitly to match Iceberg table schema (BIGINT for corporate_id)
+    schema = StructType([
+        StructField("corporate_id", LongType(), True),
+        StructField("corporate_name", StringType(), True),
+        StructField("address", StringType(), True),
+        StructField("activity_places", StringType(), True),
+        StructField("supplier_count", IntegerType(), True),
+        StructField("revenue", DoubleType(), True),
+        StructField("profit", DoubleType(), True),
+        StructField("main_customers", StringType(), True)
+    ])
+    
+    return spark.createDataFrame(harmonized_records, schema=schema)
 
 def upsert_to_iceberg(spark, harmonized_df):
     """Upsert data to Iceberg table"""

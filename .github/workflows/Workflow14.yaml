@@ -1,0 +1,132 @@
+name: Workflow14
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  trigger-emr:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ Checkout repo (REQUIRED)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2️⃣ Configure AWS credentials (MUST come before AWS CLI)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 3️⃣ Upload all Spark scripts and dependencies to S3
+      - name: Upload Spark scripts to S3
+        run: |
+          echo "📦 Uploading all Python scripts to S3..."
+          aws s3 cp src/ s3://${{ secrets.S3_BUCKET }}/scripts/ --recursive --exclude "*.pyc" --exclude "__pycache__/*"
+          echo "✅ Uploaded scripts:"
+          aws s3 ls s3://${{ secrets.S3_BUCKET }}/scripts/ --recursive
+
+      # 4️⃣ Create Python package zip for dependencies
+      - name: Package Python dependencies
+        run: |
+          echo "📦 Creating Python package for dependencies..."
+          cd src
+          zip -r ../scripts_package.zip entity_resolution.py ml_training.py __init__.py
+          cd ..
+          aws s3 cp scripts_package.zip s3://${{ secrets.S3_BUCKET }}/scripts/scripts_package.zip
+          echo "✅ Dependencies packaged and uploaded"
+
+      # 5️⃣ Trigger EMR Spark job with proper configuration
+      - name: Trigger EMR Spark jobs (WRITE → READ)
+        id: emr_step
+        run: |
+          echo "🚀 Submitting Spark job to EMR cluster: ${{ secrets.EMR_CLUSTER_ID }}"
+          echo "📂 Main script: s3://${{ secrets.S3_BUCKET }}/scripts/cloud_pipeline.py"
+          echo "📦 Dependencies: s3://${{ secrets.S3_BUCKET }}/scripts/scripts_package.zip"
+          
+          # Submit the job and capture step ID
+          # Using --py-files to include dependencies as a zip file
+          STEP_OUTPUT=$(aws emr add-steps \
+            --cluster-id "${{ secrets.EMR_CLUSTER_ID }}" \
+            --steps \
+            Type=Spark,Name=CorporateRegistryIcebergMerge,ActionOnFailure=CONTINUE,Args=[--deploy-mode,cluster,--py-files,s3://${{ secrets.S3_BUCKET }}/scripts/scripts_package.zip,s3://${{ secrets.S3_BUCKET }}/scripts/cloud_pipeline.py])
+          
+          # Extract step ID from output
+          STEP_ID=$(echo $STEP_OUTPUT | jq -r '.StepIds[0]')
+          echo "step_id=$STEP_ID" >> $GITHUB_OUTPUT
+          echo "📝 EMR Step ID: $STEP_ID"
+          echo "✅ Job submitted successfully. Step ID: $STEP_ID"
+
+      # 6️⃣ Wait for EMR step completion and show logs
+      - name: Wait for EMR step completion
+        run: |
+          STEP_ID="${{ steps.emr_step.outputs.step_id }}"
+          CLUSTER_ID="${{ secrets.EMR_CLUSTER_ID }}"
+          
+          echo "⏳ Waiting for EMR step $STEP_ID to complete..."
+          
+          # Wait for step to complete (poll every 30 seconds, max 60 minutes)
+          MAX_ATTEMPTS=120
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            STATUS=$(aws emr describe-step \
+              --cluster-id "$CLUSTER_ID" \
+              --step-id "$STEP_ID" \
+              --query 'Step.Status.State' \
+              --output text)
+            
+            echo "📊 Step status (attempt $((ATTEMPT+1))/$MAX_ATTEMPTS): $STATUS"
+            
+            if [ "$STATUS" = "COMPLETED" ]; then
+              echo "✅ Step completed successfully!"
+              break
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELLED" ]; then
+              echo "❌ Step failed with status: $STATUS"
+              exit 1
+            fi
+            
+            sleep 30
+            ATTEMPT=$((ATTEMPT+1))
+          done
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "⏰ Timeout waiting for step to complete"
+            exit 1
+          fi
+
+      # 7️⃣ Get and display EMR step logs
+      - name: Display EMR step logs
+        if: always()
+        run: |
+          STEP_ID="${{ steps.emr_step.outputs.step_id }}"
+          CLUSTER_ID="${{ secrets.EMR_CLUSTER_ID }}"
+          
+          echo "📋 Fetching EMR step logs..."
+          
+          # Get step details
+          aws emr describe-step \
+            --cluster-id "$CLUSTER_ID" \
+            --step-id "$STEP_ID" \
+            --query 'Step.{Name:Name,Status:Status.State,Message:Status.StateChangeReason.Message}' \
+            --output table
+          
+          # Try to get log URI (if available)
+          LOG_URI=$(aws emr describe-step \
+            --cluster-id "$CLUSTER_ID" \
+            --step-id "$STEP_ID" \
+            --query 'Step.Status.StateChangeReason.Message' \
+            --output text | grep -oP 's3://[^\s]+' | head -1 || echo "")
+          
+          if [ -n "$LOG_URI" ]; then
+            echo "📄 Log location: $LOG_URI"
+            echo "💡 To view full logs, run: aws s3 cp $LOG_URI -"
+          fi
+          
+          echo "✅ Workflow completed!"
+

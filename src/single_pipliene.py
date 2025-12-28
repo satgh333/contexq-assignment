@@ -6,7 +6,7 @@ import re
 import Levenshtein
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import col, udf, monotonically_increasing_id
-from pyspark.sql.types import StringType, IntegerType
+from pyspark.sql.types import StringType, IntegerType, StructType, StructField, DoubleType
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.classification import LogisticRegression
@@ -178,7 +178,7 @@ def run_cloud_pipeline():
         supply_pandas = supply_df.toPandas()
         for idx, row in supply_pandas.iterrows():
             harmonized_records.append({
-                "corporate_id": id_mapping[f"s1_{idx}"],
+                "corporate_id": str(id_mapping[f"s1_{idx}"]),  # Convert to string to match table schema
                 "corporate_name": row.get("corporate_name_S1"),
                 "address": row.get("address"),
                 "supplier_count": row.get("supplier_count", 0),
@@ -188,7 +188,7 @@ def run_cloud_pipeline():
 
         financial_pandas = financial_df.toPandas()
         for idx, row in financial_pandas.iterrows():
-            corporate_id = id_mapping[f"s2_{idx}"]
+            corporate_id = str(id_mapping[f"s2_{idx}"])  # Convert to string to match table schema
             existing = next(
                 (r for r in harmonized_records if r["corporate_id"] == corporate_id),
                 None
@@ -207,7 +207,17 @@ def run_cloud_pipeline():
                     "profit": row.get("profit")
                 })
 
-        harmonized_df = spark.createDataFrame(harmonized_records)
+        # Define schema explicitly to match Iceberg table schema
+        schema = StructType([
+            StructField("corporate_id", StringType(), True),
+            StructField("corporate_name", StringType(), True),
+            StructField("address", StringType(), True),
+            StructField("supplier_count", IntegerType(), True),
+            StructField("revenue", DoubleType(), True),
+            StructField("profit", DoubleType(), True)
+        ])
+        
+        harmonized_df = spark.createDataFrame(harmonized_records, schema=schema)
 
         # ------------------------------------------------------------
         # 5. Iceberg database & target table
@@ -231,10 +241,30 @@ def run_cloud_pipeline():
 
         # ------------------------------------------------------------
         # 6. Write to staging Iceberg table
+        # Ensure staging table has the same schema as main table
+        # Drop and recreate staging table to ensure clean state and correct schema
         # ------------------------------------------------------------
-        harmonized_df.writeTo(
+        spark.sql("""
+            DROP TABLE IF EXISTS glue_catalog.corporate_db.corporate_registry_staging
+        """)
+        
+        # Create staging table with explicit schema matching main table
+        spark.sql("""
+            CREATE TABLE glue_catalog.corporate_db.corporate_registry_staging (
+                corporate_id STRING,
+                corporate_name STRING,
+                address STRING,
+                supplier_count INT,
+                revenue DOUBLE,
+                profit DOUBLE
+            )
+            USING iceberg
+        """)
+        
+        # Write data to staging table
+        harmonized_df.write.format("iceberg").mode("append").saveAsTable(
             "glue_catalog.corporate_db.corporate_registry_staging"
-        ).using("iceberg").createOrReplace()
+        )
 
         # ------------------------------------------------------------
         # 7. UPSERT into main Iceberg table (MERGE INTO)
