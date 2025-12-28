@@ -1,35 +1,132 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, size
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
-import os
+# Add immediate output to verify script is running - MUST be first
 import sys
-import boto3
-from datetime import datetime
+import os
+
+# Force output to stderr (which goes to Spark logs)
+def log(msg):
+    print(msg, file=sys.stderr)
+    sys.stderr.flush()
+
+log("=" * 80)
+log("🚀 cloud_pipeline.py: Script started")
+log(f"Python executable: {sys.executable}")
+log(f"Python version: {sys.version}")
+log(f"Current working directory: {os.getcwd()}")
+log("=" * 80)
+
+# Check environment variables early
+log("🔍 Checking environment variables...")
+s3_bucket = os.environ.get("S3_BUCKET")
+if s3_bucket:
+    log(f"✅ S3_BUCKET is set: {s3_bucket}")
+else:
+    log("⚠️  S3_BUCKET is NOT set (will fail later if not provided)")
+
+log("📦 Starting imports...")
+
+try:
+    from pyspark.sql import SparkSession
+    from pyspark.sql.functions import col, size
+    from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+    import boto3
+    from datetime import datetime
+    log("✅ Core imports successful")
+except Exception as e:
+    log(f"❌ Core imports failed: {e}")
+    import traceback
+    traceback.print_exc(file=sys.stderr)
+    sys.stderr.flush()
+    raise
 
 # When using --py-files with Spark, the zip file is extracted and modules are available
-# Add current directory to path as fallback
+# Add current directory and common temp locations to path
+log("📂 Setting up Python path for imports...")
 if '__file__' in globals():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
+        log(f"Added script directory to path: {script_dir}")
+
+# Add common temp locations where Spark extracts --py-files
+for path in ['/tmp', '/mnt/tmp', os.path.expanduser('~'), '/var/task']:
+    if path not in sys.path and os.path.exists(path):
+        sys.path.insert(0, path)
+
+# Try to find where Spark extracted the zip file by looking for our modules
+log("🔍 Searching for extracted zip file location...")
+import glob
+for search_path in sys.path:
+    if os.path.exists(search_path):
+        # Look for entity_resolution.py in this path
+        entity_file = os.path.join(search_path, "entity_resolution.py")
+        if os.path.exists(entity_file):
+            log(f"✅ Found entity_resolution.py at: {entity_file}")
+            if search_path not in sys.path:
+                sys.path.insert(0, search_path)
+            break
+        # Also check subdirectories
+        for root, dirs, files in os.walk(search_path):
+            if "entity_resolution.py" in files:
+                log(f"✅ Found entity_resolution.py in subdirectory: {root}")
+                if root not in sys.path:
+                    sys.path.insert(0, root)
+                break
+
+log(f"📂 Final sys.path (first 8): {sys.path[:8]}")
 
 # Import dependencies (will work with --py-files zip or if files are in same directory)
+log("🔍 Attempting to import entity_resolution...")
+
 try:
     from entity_resolution import assign_corporate_ids
-    print(f"[{datetime.now()}] ✅ Successfully imported entity_resolution")
+    log("✅ Successfully imported entity_resolution")
 except ImportError as e:
-    print(f"[{datetime.now()}] ❌ Failed to import entity_resolution: {e}")
-    print(f"[{datetime.now()}] 📂 Current sys.path: {sys.path}")
-    print(f"[{datetime.now()}] 💡 Make sure entity_resolution.py is included in --py-files zip")
+    log(f"❌ Failed to import entity_resolution: {e}")
+    log(f"📂 Full sys.path: {sys.path}")
+    log("💡 Trying to find entity_resolution.py manually...")
+    
+    # Try to find the file manually
+    import glob
+    for path in sys.path:
+        potential_file = os.path.join(path, "entity_resolution.py")
+        if os.path.exists(potential_file):
+            log(f"✅ Found entity_resolution.py at: {potential_file}")
+            break
+    else:
+        log("❌ entity_resolution.py not found in any sys.path location")
+    
+    import traceback
+    traceback.print_exc(file=sys.stderr)
+    sys.stderr.flush()
     raise
+
+log("🔍 Attempting to import ml_training...")
 
 try:
     from ml_training import train_model
-    print(f"[{datetime.now()}] ✅ Successfully imported ml_training")
+    log("✅ Successfully imported ml_training")
 except ImportError as e:
-    print(f"[{datetime.now()}] ❌ Failed to import ml_training: {e}")
-    print(f"[{datetime.now()}] 💡 Make sure ml_training.py is included in --py-files zip")
+    log(f"❌ Failed to import ml_training: {e}")
+    log("💡 Trying to find ml_training.py manually...")
+    
+    # Try to find the file manually
+    import glob
+    for path in sys.path:
+        potential_file = os.path.join(path, "ml_training.py")
+        if os.path.exists(potential_file):
+            log(f"✅ Found ml_training.py at: {potential_file}")
+            break
+    else:
+        log("❌ ml_training.py not found in any sys.path location")
+    
+    import traceback
+    traceback.print_exc(file=sys.stderr)
+    sys.stderr.flush()
     raise
+
+log("=" * 80)
+log("✅ All imports successful - ready to run pipeline")
+log("=" * 80)
 
 # -------------------------------------------------------------------
 # Spark session (EMR-safe)
@@ -55,17 +152,25 @@ def download_s3_file(bucket, key, local_path):
 # Main pipeline
 # -------------------------------------------------------------------
 def run_cloud_pipeline():
-    print(f"\n{'='*80}")
-    print(f"[{datetime.now()}] 🚀 Starting Corporate Data Pipeline")
-    print(f"{'='*80}\n")
+    log(f"\n{'='*80}")
+    log(f"[{datetime.now()}] 🚀 Starting Corporate Data Pipeline")
+    log(f"{'='*80}\n")
+    
+    # Check S3_BUCKET early
+    bucket = os.environ.get("S3_BUCKET")
+    if not bucket:
+        error_msg = "S3_BUCKET environment variable is not set. Please set it using --conf spark.yarn.appMasterEnv.S3_BUCKET=<bucket>"
+        log(f"❌ FATAL ERROR: {error_msg}")
+        log("💡 Available environment variables:")
+        for key, value in os.environ.items():
+            if 'S3' in key or 'BUCKET' in key:
+                log(f"   {key}={value}")
+        raise ValueError(error_msg)
+    
+    log(f"[{datetime.now()}] 📦 S3 Bucket: {bucket}")
     
     spark = create_cloud_spark_session()
-    bucket = os.environ.get("S3_BUCKET")
-    
-    if not bucket:
-        raise ValueError("S3_BUCKET environment variable is not set")
-    
-    print(f"[{datetime.now()}] 📦 S3 Bucket: {bucket}")
+    log(f"[{datetime.now()}] ✅ Spark session created")
 
     # Iceberg warehouse (must match EMR config)
     warehouse = f"s3://{bucket}/iceberg/warehouse"
@@ -305,4 +410,25 @@ def run_cloud_pipeline():
 # Entry point
 # -------------------------------------------------------------------
 if __name__ == "__main__":
-    run_cloud_pipeline()
+    try:
+        log("=" * 80)
+        log("🎬 ENTRY POINT: Starting main execution")
+        log("=" * 80)
+        run_cloud_pipeline()
+        log("=" * 80)
+        log("✅ Pipeline completed successfully")
+        log("=" * 80)
+    except KeyboardInterrupt:
+        log("\n⚠️  Pipeline interrupted by user")
+        sys.exit(130)
+    except Exception as e:
+        log(f"\n{'='*80}")
+        log(f"❌ FATAL ERROR: Pipeline failed")
+        log(f"Error type: {type(e).__name__}")
+        log(f"Error message: {str(e)}")
+        log(f"{'='*80}")
+        import traceback
+        log("Full traceback:")
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        sys.exit(1)

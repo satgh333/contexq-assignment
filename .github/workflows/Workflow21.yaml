@@ -1,0 +1,506 @@
+name: Workflow21
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  trigger-emr:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ Checkout repo (REQUIRED)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2️⃣ Configure AWS credentials (MUST come before AWS CLI)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 3️⃣ Upload all Spark scripts and dependencies to S3
+      - name: Upload Spark scripts to S3
+        run: |
+          echo "📦 Uploading all Python scripts to S3..."
+          aws s3 cp src/ s3://${{ secrets.S3_BUCKET }}/scripts/ --recursive --exclude "*.pyc" --exclude "__pycache__/*"
+          echo "✅ Uploaded scripts:"
+          aws s3 ls s3://${{ secrets.S3_BUCKET }}/scripts/ --recursive
+
+      # 4️⃣ Create Python package zip for dependencies
+      - name: Package Python dependencies
+        run: |
+          echo "📦 Creating Python package for dependencies..."
+          cd src
+          # Create zip with files at root level (no directory structure)
+          zip -j ../scripts_package.zip entity_resolution.py ml_training.py __init__.py
+          cd ..
+          # Verify zip contents
+          echo "📋 Zip file contents:"
+          unzip -l scripts_package.zip || echo "Could not list zip contents"
+          aws s3 cp scripts_package.zip s3://${{ secrets.S3_BUCKET }}/scripts/scripts_package.zip
+          echo "✅ Dependencies packaged and uploaded"
+
+      # 4.5️⃣ Check EMR cluster state and handle lifecycle
+      - name: Check and manage EMR cluster state
+        id: cluster_check
+        run: |
+          CLUSTER_ID="${{ secrets.EMR_CLUSTER_ID }}"
+          echo "🔍 Checking EMR cluster state: $CLUSTER_ID"
+          
+          # Try to describe the cluster
+          CLUSTER_INFO=$(aws emr describe-cluster \
+            --cluster-id "$CLUSTER_ID" \
+            --query 'Cluster.{State:Status.State,Name:Name}' \
+            --output json 2>&1)
+          
+          if [ $? -ne 0 ]; then
+            # Cluster doesn't exist or can't be accessed
+            if echo "$CLUSTER_INFO" | grep -q "InvalidRequestException\|ClusterNotFoundException"; then
+              echo "❌ Cluster $CLUSTER_ID not found or terminated."
+              echo "💡 EMR clusters cannot be restarted once terminated."
+              echo "💡 You need to create a new cluster manually or use EMR Serverless."
+              echo ""
+              echo "📝 To create a new cluster, run:"
+              echo "aws emr create-cluster \\"
+              echo "  --name 'data-ai-pipeline-cluster' \\"
+              echo "  --release-label emr-6.15.0 \\"
+              echo "  --instance-type m5.xlarge \\"
+              echo "  --instance-count 3 \\"
+              echo "  --applications Name=Spark Name=Hadoop \\"
+              echo "  --service-role EMR_DefaultRole \\"
+              echo "  --ec2-attributes InstanceProfile=EMR_EC2_DefaultRole"
+              echo ""
+              echo "Then update EMR_CLUSTER_ID secret with the new cluster ID (j-XXXXXXXXXX)"
+              exit 1
+            else
+              echo "❌ Failed to describe cluster. Error: $CLUSTER_INFO"
+              exit 1
+            fi
+          fi
+          
+          CLUSTER_STATE=$(echo "$CLUSTER_INFO" | jq -r '.State')
+          CLUSTER_NAME=$(echo "$CLUSTER_INFO" | jq -r '.Name')
+          
+          echo "📊 Cluster: $CLUSTER_NAME"
+          echo "📊 State: $CLUSTER_STATE"
+          
+          # Valid states for adding steps: STARTING, BOOTSTRAPPING, RUNNING, WAITING
+          VALID_STATES=("STARTING" "BOOTSTRAPPING" "RUNNING" "WAITING")
+          
+          if [[ " ${VALID_STATES[@]} " =~ " ${CLUSTER_STATE} " ]]; then
+            echo "✅ Cluster is in valid state ($CLUSTER_STATE) for job submission"
+            echo "cluster_ready=true" >> $GITHUB_OUTPUT
+          elif [ "$CLUSTER_STATE" = "TERMINATING" ]; then
+            echo "⚠️  Cluster is currently terminating. Please wait for it to finish terminating, then create a new cluster."
+            echo "cluster_ready=false" >> $GITHUB_OUTPUT
+            exit 1
+          elif [ "$CLUSTER_STATE" = "TERMINATED" ]; then
+            echo "❌ Cluster is TERMINATED. EMR clusters cannot be restarted once terminated."
+            echo "💡 You must create a new cluster. See instructions above."
+            echo "cluster_ready=false" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "⚠️  Cluster is in state '$CLUSTER_STATE' which is not valid for adding steps."
+            echo "💡 Valid states are: ${VALID_STATES[*]}"
+            echo "💡 Current state: $CLUSTER_STATE"
+            echo ""
+            echo "📋 Cluster details:"
+            aws emr describe-cluster \
+              --cluster-id "$CLUSTER_ID" \
+              --query 'Cluster.{Name:Name,State:Status.State,StateChangeReason:Status.StateChangeReason.Message}' \
+              --output table
+            echo "cluster_ready=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      # 5️⃣ Trigger EMR Spark job with proper configuration
+      - name: Trigger EMR Spark jobs (WRITE → READ)
+        if: steps.cluster_check.outputs.cluster_ready == 'true'
+        id: emr_step
+        run: |
+          CLUSTER_ID="${{ secrets.EMR_CLUSTER_ID }}"
+          echo "🚀 Submitting Spark job to EMR cluster: $CLUSTER_ID"
+          echo "📂 Main script: s3://${{ secrets.S3_BUCKET }}/scripts/cloud_pipeline.py"
+          echo "📦 Dependencies: s3://${{ secrets.S3_BUCKET }}/scripts/scripts_package.zip"
+          
+          # Submit the job and capture step ID
+          # Using --py-files to include dependencies as a zip file
+          # Passing S3_BUCKET as environment variable to the Spark job
+          STEP_OUTPUT=$(aws emr add-steps \
+            --cluster-id "$CLUSTER_ID" \
+            --steps \
+            Type=Spark,Name=CorporateRegistryIcebergMerge,ActionOnFailure=CONTINUE,Args=[--deploy-mode,cluster,--conf,spark.yarn.appMasterEnv.S3_BUCKET=${{ secrets.S3_BUCKET }},--conf,spark.executorEnv.S3_BUCKET=${{ secrets.S3_BUCKET }},--py-files,s3://${{ secrets.S3_BUCKET }}/scripts/scripts_package.zip,s3://${{ secrets.S3_BUCKET }}/scripts/cloud_pipeline.py] 2>&1)
+          
+          # Check if the command succeeded
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to submit EMR step. Error:"
+            echo "$STEP_OUTPUT"
+            echo "step_id=" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          # Extract step ID from output
+          STEP_ID=$(echo "$STEP_OUTPUT" | jq -r '.StepIds[0]' 2>/dev/null)
+          
+          if [ -z "$STEP_ID" ] || [ "$STEP_ID" = "null" ]; then
+            echo "❌ Failed to extract step ID from output:"
+            echo "$STEP_OUTPUT"
+            echo "step_id=" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          echo "step_id=$STEP_ID" >> $GITHUB_OUTPUT
+          echo "📝 EMR Step ID: $STEP_ID"
+          echo "✅ Job submitted successfully. Step ID: $STEP_ID"
+
+      # 6️⃣ Wait for EMR step completion and show logs
+      - name: Wait for EMR step completion
+        if: steps.emr_step.outputs.step_id != ''
+        run: |
+          STEP_ID="${{ steps.emr_step.outputs.step_id }}"
+          CLUSTER_ID="${{ secrets.EMR_CLUSTER_ID }}"
+          
+          if [ -z "$STEP_ID" ] || [ "$STEP_ID" = "" ]; then
+            echo "⚠️  No step ID available, skipping wait step"
+            exit 0
+          fi
+          
+          echo "⏳ Waiting for EMR step $STEP_ID to complete..."
+          
+          # Wait for step to complete (poll every 30 seconds, max 60 minutes)
+          MAX_ATTEMPTS=120
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            STATUS=$(aws emr describe-step \
+              --cluster-id "$CLUSTER_ID" \
+              --step-id "$STEP_ID" \
+              --query 'Step.Status.State' \
+              --output text 2>&1)
+            
+            # Check if describe-step command failed
+            if [ $? -ne 0 ]; then
+              echo "⚠️  Failed to get step status: $STATUS"
+              sleep 30
+              ATTEMPT=$((ATTEMPT+1))
+              continue
+            fi
+            
+            echo "📊 Step status (attempt $((ATTEMPT+1))/$MAX_ATTEMPTS): $STATUS"
+            
+            if [ "$STATUS" = "COMPLETED" ]; then
+              echo "✅ Step completed successfully!"
+              break
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELLED" ]; then
+              echo "❌ Step failed with status: $STATUS"
+              
+              # Get detailed failure information
+              echo ""
+              echo "🔍 Fetching detailed failure information..."
+              
+              # Get full step details
+              STEP_DETAILS=$(aws emr describe-step \
+                --cluster-id "$CLUSTER_ID" \
+                --step-id "$STEP_ID" \
+                --output json 2>&1)
+              
+              if [ $? -eq 0 ]; then
+                # Extract failure reason - handle null/empty values
+                FAILURE_REASON=$(echo "$STEP_DETAILS" | jq -r '.Step.Status.StateChangeReason.Message // empty' 2>/dev/null)
+                FAILURE_CODE=$(echo "$STEP_DETAILS" | jq -r '.Step.Status.StateChangeReason.Code // empty' 2>/dev/null)
+                
+                # If fields are null/empty, try to get from other locations
+                if [ -z "$FAILURE_REASON" ] || [ "$FAILURE_REASON" = "null" ]; then
+                  # Try to get from Status directly
+                  FAILURE_REASON=$(echo "$STEP_DETAILS" | jq -r '.Step.Status.StateChangeReason // empty' 2>/dev/null | jq -r '.Message // empty' 2>/dev/null)
+                fi
+                
+                if [ -z "$FAILURE_CODE" ] || [ "$FAILURE_CODE" = "null" ]; then
+                  FAILURE_CODE=$(echo "$STEP_DETAILS" | jq -r '.Step.Status.StateChangeReason // empty' 2>/dev/null | jq -r '.Code // empty' 2>/dev/null)
+                fi
+                
+                # Display what we found
+                if [ -n "$FAILURE_CODE" ] && [ "$FAILURE_CODE" != "null" ] && [ "$FAILURE_CODE" != "" ]; then
+                  echo "📋 Failure Code: $FAILURE_CODE"
+                else
+                  echo "📋 Failure Code: Not provided by EMR (check logs below)"
+                fi
+                
+                if [ -n "$FAILURE_REASON" ] && [ "$FAILURE_REASON" != "null" ] && [ "$FAILURE_REASON" != "" ]; then
+                  echo "📋 Failure Message: $FAILURE_REASON"
+                else
+                  echo "📋 Failure Message: Not provided by EMR"
+                  echo "   💡 This usually means the error details are in the log files."
+                  echo "   💡 The actual error will be shown in the 'Display EMR step logs' step below."
+                fi
+                
+                # Try to construct log URI from cluster info
+                CLUSTER_LOG_URI=$(aws emr describe-cluster \
+                  --cluster-id "$CLUSTER_ID" \
+                  --query 'Cluster.LogUri' \
+                  --output text 2>&1)
+                
+                if [ -n "$CLUSTER_LOG_URI" ] && [ "$CLUSTER_LOG_URI" != "None" ] && [ "$CLUSTER_LOG_URI" != "" ]; then
+                  ESTIMATED_LOG_URI="${CLUSTER_LOG_URI%/}/steps/$STEP_ID/"
+                  echo "📄 Estimated Log Location: $ESTIMATED_LOG_URI"
+                fi
+                
+                # Show step name for context
+                STEP_NAME=$(echo "$STEP_DETAILS" | jq -r '.Step.Name // "Unknown"' 2>/dev/null)
+                echo "📝 Step Name: $STEP_NAME"
+                
+              else
+                echo "⚠️  Could not fetch detailed step information: $STEP_DETAILS"
+              fi
+              
+              echo ""
+              echo "💡 Note: When Failure Code/Message show 'Not provided', it means:"
+              echo "   - EMR didn't populate these fields (common for Spark job failures)"
+              echo "   - The actual error is in the log files (stderr.gz/stdout.gz)"
+              echo "   - Check the 'Display EMR step logs' step below for the real error"
+              echo ""
+              
+              exit 1
+            fi
+            
+            sleep 30
+            ATTEMPT=$((ATTEMPT+1))
+          done
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "⏰ Timeout waiting for step to complete"
+            exit 1
+          fi
+
+      # 7️⃣ Get and display EMR step logs with intelligent log discovery
+      - name: Display EMR step logs and errors
+        if: always() && steps.emr_step.outputs.step_id != ''
+        run: |
+          STEP_ID="${{ steps.emr_step.outputs.step_id }}"
+          CLUSTER_ID="${{ secrets.EMR_CLUSTER_ID }}"
+          
+          if [ -z "$STEP_ID" ] || [ "$STEP_ID" = "" ]; then
+            echo "⚠️  No step ID available, cannot fetch logs"
+            echo "💡 Check the 'Trigger EMR Spark jobs' step for error details"
+            exit 0
+          fi
+          
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📋 Fetching EMR step logs for step: $STEP_ID"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          
+          # Get cluster log URI
+          CLUSTER_LOG_URI=$(aws emr describe-cluster \
+            --cluster-id "$CLUSTER_ID" \
+            --query 'Cluster.LogUri' \
+            --output text 2>&1)
+          
+          echo "🔍 Cluster Log URI: $CLUSTER_LOG_URI"
+          
+          # Convert s3n:// to s3:// and normalize
+          if [[ "$CLUSTER_LOG_URI" == s3n://* ]]; then
+            CLUSTER_LOG_URI="${CLUSTER_LOG_URI/s3n:\/\//s3://}"
+          fi
+          
+          # Remove trailing slash
+          CLUSTER_LOG_URI="${CLUSTER_LOG_URI%/}"
+          
+          # Try different log path patterns
+          LOG_PATTERNS=(
+            "${CLUSTER_LOG_URI}/steps/${STEP_ID}/"
+            "${CLUSTER_LOG_URI}/steps/${STEP_ID}"
+            "s3://${CLUSTER_LOG_URI#s3://}/steps/${STEP_ID}/"
+            "s3://${CLUSTER_LOG_URI#s3://}/steps/${STEP_ID}"
+          )
+          
+          # Extract bucket and prefix
+          if [[ "$CLUSTER_LOG_URI" =~ s3://([^/]+)/(.+) ]]; then
+            BUCKET="${BASH_REMATCH[1]}"
+            PREFIX="${BASH_REMATCH[2]}"
+            
+            # Try standard EMR log structure: emr-logs/{cluster-id}/steps/{step-id}/
+            LOG_PATTERNS+=(
+              "s3://${BUCKET}/emr-logs/${CLUSTER_ID}/steps/${STEP_ID}/"
+              "s3://${BUCKET}/emr-logs/${CLUSTER_ID}/steps/${STEP_ID}"
+              "s3://${BUCKET}/${PREFIX}/steps/${STEP_ID}/"
+              "s3://${BUCKET}/${PREFIX}/steps/${STEP_ID}"
+            )
+          fi
+          
+          FOUND_LOG_PATH=""
+          
+          echo "🔍 Searching for logs in common locations..."
+          echo ""
+          
+          for LOG_PATH in "${LOG_PATTERNS[@]}"; do
+            # Remove s3:// prefix for listing
+            S3_PATH="${LOG_PATH#s3://}"
+            BUCKET_PART="${S3_PATH%%/*}"
+            KEY_PART="${S3_PATH#*/}"
+            
+            echo "   Trying: s3://${BUCKET_PART}/${KEY_PART}"
+            
+            # Check if path exists
+            if aws s3 ls "s3://${BUCKET_PART}/${KEY_PART}" > /dev/null 2>&1; then
+              FOUND_LOG_PATH="s3://${BUCKET_PART}/${KEY_PART}"
+              echo "   ✅ Found logs at: $FOUND_LOG_PATH"
+              echo ""
+              break
+            fi
+          done
+          
+          if [ -z "$FOUND_LOG_PATH" ]; then
+            echo "⚠️  Could not find logs in standard locations"
+            echo ""
+            echo "🔍 Listing all steps directories to find the correct path..."
+            
+            # Try to list steps directory
+            if [[ "$CLUSTER_LOG_URI" =~ s3://([^/]+)/(.+) ]]; then
+              BUCKET="${BASH_REMATCH[1]}"
+              PREFIX="${BASH_REMATCH[2]}"
+              
+              echo "   Searching in: s3://${BUCKET}/emr-logs/${CLUSTER_ID}/steps/"
+              STEPS_LIST=$(aws s3 ls "s3://${BUCKET}/emr-logs/${CLUSTER_ID}/steps/" 2>&1)
+              
+              if [ $? -eq 0 ]; then
+                echo "   Available step directories:"
+                echo "$STEPS_LIST" | grep "PRE" | head -10
+                echo ""
+                FOUND_LOG_PATH="s3://${BUCKET}/emr-logs/${CLUSTER_ID}/steps/${STEP_ID}/"
+                echo "   💡 Trying: $FOUND_LOG_PATH"
+              fi
+            fi
+          fi
+          
+          if [ -n "$FOUND_LOG_PATH" ]; then
+            S3_PATH="${FOUND_LOG_PATH#s3://}"
+            BUCKET_PART="${S3_PATH%%/*}"
+            KEY_PART="${S3_PATH#*/}"
+            
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "📁 ALL FILES in step directory (recursive listing)"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            # List ALL files recursively
+            ALL_FILES=$(aws s3 ls "s3://${BUCKET_PART}/${KEY_PART}" --recursive 2>/dev/null)
+            if [ -n "$ALL_FILES" ]; then
+              echo "$ALL_FILES"
+            else
+              echo "No files found in this directory"
+            fi
+            echo ""
+            
+            # Find all .gz files (compressed logs)
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🔍 Searching for log files..."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            # Find all .gz files
+            GZ_FILES=$(echo "$ALL_FILES" | grep "\.gz$" | awk '{print $4}' || echo "")
+            
+            # Find controller.gz (often contains error info)
+            CONTROLLER_LOG=$(echo "$ALL_FILES" | grep -i "controller\.gz" | awk '{print $4}' | head -1 || echo "")
+            
+            # Find stderr files
+            STDERR_FILES=$(echo "$ALL_FILES" | grep -i "stderr" | awk '{print $4}' || echo "")
+            
+            # Find stdout files
+            STDOUT_FILES=$(echo "$ALL_FILES" | grep -i "stdout" | awk '{print $4}' || echo "")
+            
+            # Find syslog files
+            SYSLOG_FILES=$(echo "$ALL_FILES" | grep -i "syslog" | awk '{print $4}' | head -1 || echo "")
+            
+            echo "Found .gz files: $(echo "$GZ_FILES" | wc -l)"
+            if [ -n "$GZ_FILES" ]; then
+              echo "$GZ_FILES" | head -10
+            fi
+            echo ""
+            
+            # Try to read controller.gz first (often has the best error info)
+            if [ -n "$CONTROLLER_LOG" ]; then
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "📋 CONTROLLER LOG (usually contains error details) - Last 200 lines"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "File: $CONTROLLER_LOG"
+              echo ""
+              aws s3 cp "s3://${BUCKET_PART}/${CONTROLLER_LOG}" - 2>/dev/null | gunzip 2>/dev/null | tail -200 || \
+              aws s3 cp "s3://${BUCKET_PART}/${CONTROLLER_LOG}" - 2>/dev/null | tail -200 || \
+              echo "Could not read controller.gz"
+              echo ""
+            fi
+            
+            # Try stderr files
+            if [ -n "$STDERR_FILES" ]; then
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "❌ STDERR LOGS - Last 150 lines from each"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              for STDERR_FILE in $STDERR_FILES; do
+                echo "File: $STDERR_FILE"
+                echo "---"
+                aws s3 cp "s3://${BUCKET_PART}/${STDERR_FILE}" - 2>/dev/null | gunzip 2>/dev/null | tail -150 || \
+                aws s3 cp "s3://${BUCKET_PART}/${STDERR_FILE}" - 2>/dev/null | tail -150 || \
+                echo "Could not read $STDERR_FILE"
+                echo ""
+              done
+            else
+              echo "⚠️  No stderr files found"
+              echo ""
+            fi
+            
+            # Try stdout files
+            if [ -n "$STDOUT_FILES" ]; then
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "📋 STDOUT LOGS - Last 100 lines from each"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              for STDOUT_FILE in $STDOUT_FILES; do
+                echo "File: $STDOUT_FILE"
+                echo "---"
+                aws s3 cp "s3://${BUCKET_PART}/${STDOUT_FILE}" - 2>/dev/null | gunzip 2>/dev/null | tail -100 || \
+                aws s3 cp "s3://${BUCKET_PART}/${STDOUT_FILE}" - 2>/dev/null | tail -100 || \
+                echo "Could not read $STDOUT_FILE"
+                echo ""
+              done
+            fi
+            
+            # Try syslog if available
+            if [ -n "$SYSLOG_FILES" ]; then
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "📋 SYSLOG - Last 100 lines"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "File: $SYSLOG_FILES"
+              echo ""
+              aws s3 cp "s3://${BUCKET_PART}/${SYSLOG_FILES}" - 2>/dev/null | gunzip 2>/dev/null | tail -100 || \
+              aws s3 cp "s3://${BUCKET_PART}/${SYSLOG_FILES}" - 2>/dev/null | tail -100 || \
+              echo "Could not read syslog"
+              echo ""
+            fi
+            
+            # If no logs found, show what files exist
+            if [ -z "$CONTROLLER_LOG" ] && [ -z "$STDERR_FILES" ] && [ -z "$STDOUT_FILES" ]; then
+              echo "⚠️  No standard log files found. Showing all available files:"
+              echo "$ALL_FILES" | head -30
+              echo ""
+              echo "💡 Try checking these files manually or check EMR console for step details"
+            fi
+            echo ""
+            
+          else
+            echo "❌ Could not locate log files automatically"
+            echo ""
+            echo "💡 Manual log location instructions:"
+            echo "   1. Go to EMR Console → Clusters → $CLUSTER_ID → Steps → $STEP_ID"
+            echo "   2. Check S3 bucket: s3://cicdbuket6060/emr-logs/${CLUSTER_ID}/steps/${STEP_ID}/"
+            echo "   3. Look for files: stderr.gz, stdout.gz, or controller.gz"
+            echo ""
+            echo "   Or run: aws s3 ls s3://cicdbuket6060/emr-logs/${CLUSTER_ID}/steps/ --recursive"
+          fi
+          
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Log retrieval completed"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
